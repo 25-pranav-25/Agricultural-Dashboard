@@ -1,0 +1,1624 @@
+---
+title: "Indian Agriculture Dashboard"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+    theme: cerulean
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(readr)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(plotly)
+library(shiny)
+library(leaflet)
+library(sf)
+library(stringr)
+library(htmltools)
+library(viridis)
+library(scales)
+library(RColorBrewer)
+library(gganimate)
+library(mapview)
+library(DT)
+```
+
+```{r data_preparation, message=FALSE, warning=FALSE, results='hide'}
+# Sample data - replace with your actual data loading code
+df_states <- read.csv("C:/Users/dodo2/Downloads/DV/df_states.csv")
+df_states$State[df_states$State == "Odisha"] <- "Orissa"
+df_states$State[df_states$State == "Uttarakhand"] <- "Uttaranchal"
+
+# Clean state names for consistency
+df_states$State <- str_to_title(df_states$State)
+
+# Load and prepare GeoJSON for India map
+india_geo <- tryCatch({
+  st_read("https://raw.githubusercontent.com/geohacker/india/master/state/india_telengana.geojson")
+}, error = function(e) {
+  message("Failed to load geojson from URL. Using simplified version.")
+  # Simplified fallback - in a real app, ensure this file exists
+  NULL
+})
+
+if (!is.null(india_geo)) {
+  india_geo$st_nm <- str_to_title(india_geo$NAME_1)
+  india_geo$State <- india_geo$st_nm
+}
+
+# Get unique values for filters
+states <- unique(df_states$State)
+crops <- unique(df_states$Crop)
+years <- unique(df_states$Crop_Year)
+
+# Define regions for analysis based on existing region column
+# If not already defined in your data, uncomment and use this:
+# df_states <- df_states %>%
+#   mutate(Region = case_when(
+#     State %in% c("Jammu & Kashmir", "Himachal Pradesh", "Punjab", "Haryana", "Uttarakhand", "Delhi") ~ "North",
+#     State %in% c("Uttar Pradesh", "Bihar", "Jharkhand", "West Bengal") ~ "East",
+#     State %in% c("Rajasthan", "Gujarat", "Maharashtra", "Goa") ~ "West",
+#     State %in% c("Madhya Pradesh", "Chhattisgarh") ~ "Central",
+#     State %in% c("Andhra Pradesh", "Telangana", "Karnataka", "Tamil Nadu", "Kerala") ~ "South",
+#     State %in% c("Assam", "Sikkim", "Manipur", "Meghalaya", "Tripura", "Nagaland", "Mizoram", "Arunachal Pradesh") ~ "North-East",
+#     TRUE ~ "Other"
+#   ))
+
+# Top 5 crops based on area
+top_5_crops <- df_states %>%
+  group_by(Crop) %>%
+  summarise(TotalArea = sum(Area, na.rm = TRUE)) %>%
+  arrange(desc(TotalArea)) %>%
+  slice(1:5) %>%
+  pull(Crop)
+
+```
+
+# Yield Choropleth Map {data-navmenu="Yield Analysis"}
+
+## Column {.sidebar}
+
+```{r sidebar_filters_tab1}
+selectInput(
+  "crop_yield_map",
+  label = "Select Crop",
+  choices = top_5_crops,
+  selected = top_5_crops[1]
+)
+
+radioButtons(
+  "metric_yield_map",
+  label = "Select Metric to Visualize",
+  choices = c("Yield", "Production", "Area"),
+  selected = "Yield"
+)
+
+sliderInput(
+  "year_yield_map",
+  label = "Select Year",
+  min = min(years),
+  max = max(years),
+  value = min(years),
+  step = 1,
+  animate = animationOptions(interval = 1500, loop = TRUE)
+)
+
+helpText("Use the slider to see how values have changed over time. Press play to animate.")
+```
+
+## Column {data-width="700"}
+
+### Choropleth Map (Over Time)
+
+```{r yield_choropleth_map}
+renderLeaflet({
+  req(input$crop_yield_map, input$year_yield_map, input$metric_yield_map)
+  
+  filtered_data <- df_states %>%
+    filter(Crop == input$crop_yield_map, Crop_Year == input$year_yield_map)
+  
+  # Set color palette based on selected metric
+  metric_var <- input$metric_yield_map
+  
+  # If we have GeoJSON available
+  if (!is.null(india_geo)) {
+    merged_data <- india_geo %>%
+      left_join(filtered_data, by = "State")
+    
+    # Create color palette for selected metric
+    pal <- colorNumeric(
+      palette = "YlGnBu",
+      domain = merged_data[[metric_var]],
+      na.color = "gray90"
+    )
+    
+    leaflet(data = merged_data) %>%
+      addProviderTiles("CartoDB.Positron") %>%
+      fitBounds(68.0, 6.5, 97.5, 37.5) %>%
+      addPolygons(
+        fillColor = ~pal(get(metric_var)),
+        color = "white",
+        weight = 1,
+        opacity = 1,
+        fillOpacity = 0.7,
+        layerId = ~State,
+        highlight = highlightOptions(
+          weight = 3,
+          color = "#666",
+          fillOpacity = 0.9,
+          bringToFront = TRUE
+        ),
+        label = ~paste(
+          "<strong>", State, "</strong><br>",
+          metric_var, ": ", round(get(metric_var), 2), "<br>",
+          "Crop: ", input$crop_yield_map, "<br>",
+          "Year: ", input$year_yield_map
+        ) %>% lapply(htmltools::HTML)
+      ) %>%
+      addLegend(pal = pal, values = ~get(metric_var), opacity = 0.7, 
+                title = metric_var, position = "bottomright")
+  } else {
+    # Fallback if no GeoJSON is available
+    leaflet() %>%
+      addProviderTiles("CartoDB.Positron") %>%
+      setView(lng = 78.9629, lat = 20.5937, zoom = 5) %>%
+      addControl(
+        html = "<p>GeoJSON data not available. Please provide a valid India GeoJSON file.</p>",
+        position = "topleft"
+      )
+  }
+})
+```
+
+## Column {data-width="300"}
+
+### Trends for Selected Crop
+
+```{r yield_trends_over_time}
+renderPlotly({
+  req(input$crop_yield_map, input$metric_yield_map)
+  
+  metric_var <- input$metric_yield_map
+  
+  trends_data <- df_states %>%
+    filter(Crop == input$crop_yield_map) %>%
+    group_by(Crop_Year) %>%
+    summarise(
+      Value = mean(get(metric_var), na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  p <- ggplot(trends_data, aes(x = Crop_Year, y = Value, 
+                            text = paste("Year:", Crop_Year, 
+                                      "<br>Average", metric_var, ":", round(Value, 2)))) +
+    geom_line(color = "#1f77b4", size = 1.2) +
+    geom_point(color = "#1f77b4", size = 3) +
+    geom_vline(xintercept = input$year_yield_map, color = "red", linetype = "dashed") +
+    theme_minimal() +
+    labs(
+      title = paste(metric_var, "Trends for", input$crop_yield_map),
+      x = "Year",
+      y = paste("Average", metric_var)
+    )
+  
+  ggplotly(p, tooltip = "text")
+})
+```
+
+### Statistics (Current Selection)
+
+```{r yield_stats}
+renderTable({
+  req(input$crop_yield_map, input$year_yield_map, input$metric_yield_map)
+  
+  metric_var <- input$metric_yield_map
+  
+  stats_data <- df_states %>%
+    filter(Crop == input$crop_yield_map, Crop_Year == input$year_yield_map) %>%
+    summarise(
+      Minimum = min(get(metric_var), na.rm = TRUE),
+      Maximum = max(get(metric_var), na.rm = TRUE),
+      Average = mean(get(metric_var), na.rm = TRUE),
+      Total = sum(get(metric_var), na.rm = TRUE),
+      StatesCount = n_distinct(State)
+    ) %>%
+    mutate(
+      Minimum = round(Minimum, 2),
+      Maximum = round(Maximum, 2),
+      Average = round(Average, 2),
+      Total = round(Total, 2)
+    )
+  
+  # Convert from wide to long format for vertical display
+  stats_long <- data.frame(
+    Statistic = c(paste("Minimum", metric_var), 
+                 paste("Maximum", metric_var), 
+                 paste("Average", metric_var), 
+                 paste("Total", metric_var),
+                 "Number of States"),
+    Value = c(stats_data$Minimum, 
+             stats_data$Maximum, 
+             stats_data$Average, 
+             stats_data$Total,
+             stats_data$StatesCount)
+  )
+  
+  stats_long
+}, rownames = FALSE)
+```
+
+# Yield vs Rainfall {data-navmenu="Environmental Analysis"}
+
+## Column {.sidebar}
+
+```{r sidebar_filters_tab2}
+selectInput(
+  "state_env",
+  label = "Select State",
+  choices = states,
+  selected = states[1]
+)
+
+selectInput(
+  "crop_env",
+  label = "Select Crop",
+  choices = top_5_crops,
+  selected = top_5_crops[1]
+)
+
+sliderInput(
+  "years_env",
+  label = "Year Range",
+  min = min(years),
+  max = max(years),
+  value = c(min(years), max(years)),
+  step = 1
+)
+
+helpText("Explore the relationship between rainfall and crop yield over time.")
+```
+
+## Column {data-width="700"}
+
+### Yield vs Rainfall Over Time
+
+```{r yield_rainfall_over_time}
+renderPlotly({
+  req(input$state_env, input$crop_env)
+  
+  filtered_data <- df_states %>%
+    filter(
+      State == input$state_env, 
+      Crop == input$crop_env,
+      Crop_Year >= input$years_env[1],
+      Crop_Year <= input$years_env[2]
+    )
+  
+  # Create dual axis plot
+  p <- plot_ly(filtered_data) %>%
+    add_trace(
+      x = ~Crop_Year,
+      y = ~Yield,
+      name = "Yield",
+      type = "scatter",
+      mode = "lines+markers",
+      line = list(color = "#1f77b4", width = 3),
+      marker = list(color = "#1f77b4", size = 8),
+      hoverinfo = "text",
+      text = ~paste("Year:", Crop_Year, "<br>Yield:", round(Yield, 2))
+    ) %>%
+    add_trace(
+      x = ~Crop_Year,
+      y = ~Annual_Rainfall,
+      name = "Rainfall (mm)",
+      type = "scatter",
+      mode = "lines+markers",
+      line = list(color = "#ff7f0e", width = 3, dash = "dot"),
+      marker = list(color = "#ff7f0e", size = 8),
+      hoverinfo = "text",
+      text = ~paste("Year:", Crop_Year, "<br>Rainfall:", round(Annual_Rainfall, 2), "mm"),
+      yaxis = "y2"
+    ) %>%
+    layout(
+      title = paste("Yield vs Rainfall for", input$crop_env, "in", input$state_env),
+      xaxis = list(title = "Year"),
+      yaxis = list(
+        title = "Yield",
+        titlefont = list(color = "#1f77b4"),
+        tickfont = list(color = "#1f77b4")
+      ),
+      yaxis2 = list(
+        title = "Rainfall (mm)",
+        titlefont = list(color = "#ff7f0e"),
+        tickfont = list(color = "#ff7f0e"),
+        overlaying = "y",
+        side = "right"
+      ),
+      legend = list(x = 0.1, y = 1.1, orientation = "h"),
+      hovermode = "closest"
+    )
+  
+  p
+})
+```
+
+### Correlation Scatter Plot
+
+```{r yield_rainfall_correlation}
+renderPlotly({
+  req(input$state_env, input$crop_env)
+  
+  corr_data <- df_states %>%
+    filter(
+      State == input$state_env, 
+      Crop == input$crop_env,
+      Crop_Year >= input$years_env[1],
+      Crop_Year <= input$years_env[2]
+    )
+  
+  # Calculate correlation
+  correlation <- cor(corr_data$Annual_Rainfall, corr_data$Yield, use = "complete.obs")
+  
+  p <- ggplot(corr_data, aes(x = Annual_Rainfall, y = Yield, 
+                           text = paste("Year:", Crop_Year,
+                                      "<br>Rainfall:", round(Annual_Rainfall, 2), "mm",
+                                      "<br>Yield:", round(Yield, 2)))) +
+    geom_point(aes(color = Crop_Year), size = 4) +
+    geom_smooth(method = "lm", se = TRUE, color = "red") +
+    scale_color_viridis_c() +
+    theme_minimal() +
+    labs(
+      title = paste("Correlation between Rainfall and Yield: r =", round(correlation, 2)),
+      subtitle = paste(input$crop_env, "in", input$state_env),
+      x = "Annual Rainfall (mm)",
+      y = "Yield"
+    )
+  
+  ggplotly(p, tooltip = "text")
+})
+```
+
+# Fertilizer & Pesticide Insights {data-navmenu="Environmental Analysis"}
+
+## Column {.sidebar}
+
+```{r sidebar_filters_tab3}
+selectInput(
+  "state_fert",
+  label = "Select State",
+  choices = states,
+  selected = states[1]
+)
+
+selectInput(
+  "crop_fert",
+  label = "Select Crop",
+  choices = top_5_crops,
+  selected = top_5_crops[1]
+)
+
+sliderInput(
+  "year_fert",
+  label = "Select Year",
+  min = min(years),
+  max = max(years),
+  value = max(years),
+  step = 1
+)
+
+helpText("Explore how fertilizer and pesticide usage affects crop yields.")
+```
+
+## Column {data-width="700"}
+
+### Fertilizer & Pesticide Impact on Yield
+
+```{r fertilizer_pesticide_impact}
+renderPlotly({
+  req(input$state_fert, input$crop_fert)
+  
+  # Create time-series data for all years
+  factors_data <- df_states %>%
+    filter(State == input$state_fert, Crop == input$crop_fert) %>%
+    select(Crop_Year, Yield, Fertilizer, Pesticide)
+  
+  # Normalize data for comparison
+  factors_long <- factors_data %>%
+    mutate(
+      Fertilizer_Norm = (Fertilizer - min(Fertilizer, na.rm = TRUE)) / 
+                      (max(Fertilizer, na.rm = TRUE) - min(Fertilizer, na.rm = TRUE)),
+      Pesticide_Norm = (Pesticide - min(Pesticide, na.rm = TRUE)) / 
+                     (max(Pesticide, na.rm = TRUE) - min(Pesticide, na.rm = TRUE)),
+      Yield_Norm = (Yield - min(Yield, na.rm = TRUE)) / 
+                  (max(Yield, na.rm = TRUE) - min(Yield, na.rm = TRUE))
+    ) %>%
+    pivot_longer(
+      cols = c(Fertilizer_Norm, Pesticide_Norm, Yield_Norm),
+      names_to = "Factor",
+      values_to = "Normalized_Value"
+    )
+  
+  # Make factor names more readable
+  factors_long$Factor <- factor(factors_long$Factor, 
+                              levels = c("Yield_Norm", "Fertilizer_Norm", "Pesticide_Norm"),
+                              labels = c("Yield", "Fertilizer", "Pesticide"))
+  
+  # Add vertical line for selected year
+  p <- ggplot(factors_long, aes(x = Crop_Year, y = Normalized_Value, color = Factor, 
+                              group = Factor, 
+                              text = paste(Factor, ":", round(Normalized_Value, 2)))) +
+    geom_line(size = 1.2) +
+    geom_point(size = 3) +
+    geom_vline(xintercept = input$year_fert, linetype = "dashed", color = "gray50") +
+    theme_minimal() +
+    labs(
+      title = paste("Normalized Factors Impact on", input$crop_fert, "Yield in", input$state_fert),
+      x = "Year",
+      y = "Normalized Value (0-1)",
+      color = "Factor"
+    ) +
+    scale_color_manual(values = c("Yield" = "#2ca02c", "Fertilizer" = "#1f77b4", "Pesticide" = "#d62728"))
+  
+  ggplotly(p, tooltip = "text")
+})
+```
+
+### Bubble Plot: Fertilizer vs Pesticide vs Yield
+
+```{r bubble_plot_fertilizer_pesticide}
+renderPlotly({
+  req(input$crop_fert)
+  
+  # Get data for all states for the selected year and crop
+  bubble_data <- df_states %>%
+    filter(
+      Crop == input$crop_fert,
+      Crop_Year == input$year_fert
+    )
+  
+  # Create bubble plot
+  p <- plot_ly(
+    data = bubble_data,
+    x = ~Fertilizer,
+    y = ~Pesticide,
+    size = ~Yield,
+    color = ~State,
+    sizes = c(5, 50),
+    type = "scatter",
+    mode = "markers",
+    marker = list(
+      opacity = 0.7,
+      sizemode = "diameter"
+    ),
+    text = ~paste(
+      "State:", State,
+      "<br>Fertilizer:", round(Fertilizer, 2),
+      "<br>Pesticide:", round(Pesticide, 2),
+      "<br>Yield:", round(Yield, 2)
+    ),
+    hoverinfo = "text"
+  ) %>%
+    layout(
+      title = paste("Fertilizer vs Pesticide vs Yield(Bubble size = Yield, Color = State) for", input$crop_fert, "in", input$year_fert),
+      xaxis = list(title = "Fertilizer Usage"),
+      yaxis = list(title = "Pesticide Usage"),
+      showlegend = FALSE
+    )
+  
+  p
+})
+```
+
+# Regional Yield Analysis {data-navmenu="Regional Analysis"}
+
+## Column {.sidebar}
+
+```{r sidebar_filters_tab4}
+selectInput(
+  "crop_region",
+  label = "Select Crop",
+  choices = top_5_crops,
+  selected = top_5_crops[1]
+)
+
+sliderInput(
+  "years_region",
+  label = "Year Range",
+  min = min(years),
+  max = max(years),
+  value = c(min(years), max(years)),
+  step = 1
+)
+
+# If regions are not already defined in your data, create them here
+# Otherwise, use your existing region definition
+region_choices <- unique(df_states$Region)
+if(length(region_choices) == 0) {
+  region_choices <- c("North", "South", "East", "West", "Central", "North-East")
+}
+
+checkboxGroupInput(
+  "regions_selected",
+  label = "Select Regions",
+  choices = region_choices,
+  selected = region_choices
+)
+
+helpText("Compare yield performance across different regions of India.")
+```
+
+## Column {data-width="700"}
+
+### Regional Yield Comparison
+
+```{r regional_yield_comparison}
+renderPlotly({
+  req(input$crop_region, input$regions_selected)
+  
+  # Filter data by selected parameters
+  regional_data <- df_states %>%
+    filter(
+      Crop == input$crop_region,
+      Crop_Year >= input$years_region[1],
+      Crop_Year <= input$years_region[2],
+      Region %in% input$regions_selected
+    ) %>%
+    group_by(Region, Crop_Year) %>%
+    summarise(
+      Avg_Yield = mean(Yield, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  # Plot yield by region over time
+  p <- ggplot(regional_data, aes(x = Crop_Year, y = Avg_Yield, color = Region, 
+                              group = Region, 
+                              text = paste("Region:", Region, 
+                                        "<br>Year:", Crop_Year, 
+                                        "<br>Avg Yield:", round(Avg_Yield, 2)))) +
+    geom_line(size = 1.2) +
+    geom_point(size = 3) +
+    theme_minimal() +
+    labs(
+      title = paste(input$crop_region, "Average Yield by Region"),
+      x = "Year",
+      y = "Average Yield"
+    ) +
+    scale_color_brewer(palette = "Set1")
+  
+  ggplotly(p, tooltip = "text")
+})
+```
+
+### Regional Yield Heatmap
+
+```{r regional_yield_heatmap}
+renderPlotly({
+  req(input$crop_region, input$regions_selected)
+  
+  # Filter data and create heatmap
+  heatmap_data <- df_states %>%
+    filter(
+      Crop == input$crop_region,
+      Crop_Year >= input$years_region[1],
+      Crop_Year <= input$years_region[2],
+      Region %in% input$regions_selected
+    ) %>%
+    group_by(Region, Crop_Year) %>%
+    summarise(
+      Avg_Yield = mean(Yield, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  # Create heatmap
+  p <- ggplot(heatmap_data, aes(x = Crop_Year, y = Region, fill = Avg_Yield,
+                              text = paste("Region:", Region,
+                                        "<br>Year:", Crop_Year,
+                                        "<br>Avg Yield:", round(Avg_Yield, 2)))) +
+    geom_tile() +
+    scale_fill_viridis_c() +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      panel.grid = element_blank()
+    ) +
+    labs(
+      title = paste(input$crop_region, "Yield by Region and Year"),
+      x = "Year",
+      y = "Region",
+      fill = "Avg Yield"
+    )
+  
+  ggplotly(p, tooltip = "text")
+})
+```
+
+## Column {data-width="300"}
+
+### Top Performing Regions
+
+```{r top_regions_table}
+renderDataTable({
+  req(input$crop_region, input$regions_selected)
+  
+  # Calculate overall average yield by region across selected years
+  top_regions <- df_states %>%
+    filter(
+      Crop == input$crop_region,
+      Crop_Year >= input$years_region[1],
+      Crop_Year <= input$years_region[2],
+      Region %in% input$regions_selected
+    ) %>%
+    group_by(Region) %>%
+    summarise(
+      Avg_Yield = mean(Yield, na.rm = TRUE),
+      Max_Yield = max(Yield, na.rm = TRUE),
+      Min_Yield = min(Yield, na.rm = TRUE),
+      Variability = sd(Yield, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(Avg_Yield)) %>%
+    mutate(
+      Avg_Yield = round(Avg_Yield, 2),
+      Max_Yield = round(Max_Yield, 2),
+      Min_Yield = round(Min_Yield, 2),
+      Variability = round(Variability, 2)
+    )
+  
+  datatable(
+    top_regions,
+    options = list(
+      pageLength = 5,
+      dom = 'tp'
+    )
+  )
+})
+```
+
+### Regional Yield Distribution
+
+```{r regional_yield_boxplot}
+renderPlotly({
+  req(input$crop_region, input$regions_selected)
+  
+  # Get data for box plot
+  boxplot_data <- df_states %>%
+    filter(
+      Crop == input$crop_region,
+      Crop_Year >= input$years_region[1],
+      Crop_Year <= input$years_region[2],
+      Region %in% input$regions_selected
+    )
+  
+  # Create box plot
+  p <- ggplot(boxplot_data, aes(x = Region, y = Yield, fill = Region)) +
+    geom_boxplot(alpha = 0.7) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none"
+    ) +
+    labs(
+      title = paste("Yield Distribution by Region for", input$crop_region),
+      x = "Region",
+      y = "Yield"
+    ) +
+    scale_fill_brewer(palette = "Set1")
+  
+  ggplotly(p)
+})
+```
+
+
+
+# MSP vs Yield/Production Analysis {data-navmenu="Price Analysis"}
+
+## Column {.sidebar}
+
+```{r sidebar_filters_msp_tab}
+# Add code to load MSP data
+msp_data <- read.csv("C:/Users/dodo2/Downloads/DV/df_msp.csv") %>%
+  # Rename columns for consistency
+  rename(Crop = Commodity) %>%
+  # Clean up crop names for better matching
+  mutate(Crop = str_to_title(Crop))
+
+# Fix Rice/Paddy naming
+msp_data$Crop <- ifelse(msp_data$Crop == "Paddy", "Rice", msp_data$Crop)
+df_states$Crop <- ifelse(df_states$Crop == "Paddy", "Rice", df_states$Crop)
+
+# Prepare MSP data - convert from wide to long format
+msp_long <- msp_data %>%
+  select(-Sl..No., -Category, -Variety) %>%
+  pivot_longer(
+    cols = starts_with("X"),
+    names_to = "Year",
+    values_to = "MSP"
+  ) %>%
+  # Extract year from column names (X2013.14 becomes 2013)
+  mutate(
+    Crop_Year = as.numeric(str_replace(str_extract(Year, "\\d{4}"), "^X", "")),
+    MSP = as.numeric(MSP)
+  ) %>%
+  # If there are multiple varieties for same crop, calculate average MSP
+  group_by(Crop, Crop_Year) %>%
+  summarise(Avg_MSP = mean(MSP, na.rm = TRUE), .groups = 'drop')
+
+# Get list of crops that appear in both datasets
+common_crops <- intersect(unique(msp_long$Crop), unique(df_states$Crop))
+
+# Filter options for UI
+selectInput(
+  "crop_msp",
+  label = "Select Crop",
+  choices = common_crops,
+  selected = common_crops[1]
+)
+
+selectInput(
+  "state_msp",
+  label = "Select State",
+  choices = c("All India", states),
+  selected = "All India"
+)
+
+sliderInput(
+  "years_msp",
+  label = "Year Range",
+  min = min(msp_long$Crop_Year, na.rm = TRUE),
+  max = max(msp_long$Crop_Year, na.rm = TRUE),
+  value = c(min(msp_long$Crop_Year, na.rm = TRUE), 
+            max(msp_long$Crop_Year, na.rm = TRUE)),
+  step = 1
+)
+
+radioButtons(
+  "metric_msp",
+  label = "Compare MSP with:",
+  choices = c("Yield", "Production"),
+  selected = "Yield"
+)
+
+helpText("Explore the relationship between MSP and crop yield/production over time.")
+```
+
+## Column {data-width="700"}
+
+### MSP vs Yield/Production Trend Analysis
+
+```{r msp_yield_trend}
+# Render the MSP vs Yield/Production plot
+renderPlotly({
+  req(input$crop_msp)
+  
+  # Get MSP data for selected crop
+  msp_filtered <- msp_long %>%
+    filter(
+      Crop == input$crop_msp,
+      Crop_Year >= input$years_msp[1],
+      Crop_Year <= input$years_msp[2]
+    )
+  
+  # Get yield/production data for the selected crop and state
+  metric_var <- input$metric_msp
+  
+  if(input$state_msp == "All India") {
+    # Calculate national average yield/production
+    yield_filtered <- df_states %>%
+      filter(
+        Crop == input$crop_msp,
+        Crop_Year >= input$years_msp[1],
+        Crop_Year <= input$years_msp[2]
+      ) %>%
+      group_by(Crop_Year) %>%
+      summarise(
+        Avg_Yield = mean(Yield, na.rm = TRUE),
+        Avg_Production = sum(Production, na.rm = TRUE),  # Sum for production
+        .groups = 'drop'
+      )
+  } else {
+    # Get state-specific yield/production
+    yield_filtered <- df_states %>%
+      filter(
+        State == input$state_msp,
+        Crop == input$crop_msp,
+        Crop_Year >= input$years_msp[1],
+        Crop_Year <= input$years_msp[2]
+      ) %>%
+      group_by(Crop_Year) %>%
+      summarise(
+        Avg_Yield = mean(Yield, na.rm = TRUE),
+        Avg_Production = sum(Production, na.rm = TRUE),  # Sum for production
+        .groups = 'drop'
+      )
+  }
+  
+  # Join MSP and yield/production data
+  combined_data <- msp_filtered %>%
+    left_join(yield_filtered, by = "Crop_Year")
+  
+  # Determine which metric to use
+  y_var <- ifelse(metric_var == "Yield", "Avg_Yield", "Avg_Production")
+  y_title <- ifelse(metric_var == "Yield", "Yield", "Production (MT)")
+  
+  # Get nice y-axis ranges for both metrics
+  msp_range <- range(combined_data$Avg_MSP, na.rm = TRUE)
+  metric_range <- range(combined_data[[y_var]], na.rm = TRUE)
+  
+  # Add 10% padding to ranges
+  msp_padding <- diff(msp_range) * 0.1
+  metric_padding <- diff(metric_range) * 0.1
+  
+  msp_range <- c(msp_range[1] - msp_padding, msp_range[2] + msp_padding)
+  metric_range <- c(metric_range[1] - metric_padding, metric_range[2] + metric_padding)
+  
+  # Create dual axis plot with improved formatting
+  p <- plot_ly() %>%
+    add_trace(
+      data = combined_data,
+      x = ~Crop_Year,
+      y = ~Avg_MSP,
+      name = "MSP (₹)",
+      type = "scatter",
+      mode = "lines+markers",
+      line = list(color = "#2c3e50", width = 3),
+      marker = list(color = "#2c3e50", size = 8),
+      hoverinfo = "text",
+      text = ~paste("Year:", Crop_Year, "<br>MSP: ₹", round(Avg_MSP, 2))
+    ) %>%
+    add_trace(
+      data = combined_data,
+      x = ~Crop_Year,
+      y = ~get(y_var),
+      name = y_title,
+      type = "scatter",
+      mode = "lines+markers",
+      line = list(color = "#e74c3c", width = 3),
+      marker = list(color = "#e74c3c", size = 8),
+      hoverinfo = "text",
+      text = ~paste("Year:", Crop_Year, "<br>", metric_var, ":", round(get(y_var), 2)),
+      yaxis = "y2"
+    ) %>%
+    layout(
+      title = list(
+        text = paste("MSP vs", metric_var, "Trends for", input$crop_msp,
+                  ifelse(input$state_msp == "All India", "(National Average)", 
+                        paste("in", input$state_msp))),
+        y = 0.97,  # Lower the title position slightly
+        x = 0.5
+      ),
+      xaxis = list(
+        title = "Year",
+        dtick = 1,  # Show every year on x-axis if possible
+        tickangle = 45
+      ),
+      yaxis = list(
+        title = "MSP (₹)",
+        titlefont = list(color = "#2c3e50"),
+        tickfont = list(color = "#2c3e50"),
+        range = msp_range,
+        side = "left",
+        showgrid = FALSE
+      ),
+      yaxis2 = list(
+        title = y_title,
+        titlefont = list(color = "#e74c3c"),
+        tickfont = list(color = "#e74c3c"),
+        overlaying = "y",
+        side = "right",
+        range = metric_range,
+        showgrid = FALSE,
+        nticks = 10  # More readings on the yield/production scale
+      ),
+      legend = list(
+        orientation = "h",
+        xanchor = "center",
+        x = 0.5,
+        y = 1.1
+      ),
+      margin = list(t = 120, b = 80, l = 80, r = 80),  # Increased margins
+      hovermode = "closest"
+    )
+  
+  p
+})
+```
+
+## Column {data-width="300"}
+
+### Price-Performance Relationship
+
+```{r msp_performance_relationship}
+renderPlotly({
+  req(input$crop_msp)
+  
+  # Determine which metric to use
+  metric_var <- ifelse(input$metric_msp == "Yield", "Avg_Yield", "Avg_Production")
+  metric_label <- ifelse(input$metric_msp == "Yield", "Yield", "Production")
+  
+  # Get MSP data for selected crop
+  msp_filtered <- msp_long %>%
+    filter(
+      Crop == input$crop_msp,
+      Crop_Year >= input$years_msp[1],
+      Crop_Year <= input$years_msp[2]
+    )
+  
+  # Get yield/production data for the selected crop and state
+  if(input$state_msp == "All India") {
+    perf_data <- df_states %>%
+      filter(
+        Crop == input$crop_msp,
+        Crop_Year >= input$years_msp[1],
+        Crop_Year <= input$years_msp[2]
+      ) %>%
+      group_by(Crop_Year) %>%
+      summarise(
+        Avg_Yield = mean(Yield, na.rm = TRUE),
+        Avg_Production = sum(Production, na.rm = TRUE),
+        .groups = 'drop'
+      )
+  } else {
+    perf_data <- df_states %>%
+      filter(
+        State == input$state_msp,
+        Crop == input$crop_msp,
+        Crop_Year >= input$years_msp[1],
+        Crop_Year <= input$years_msp[2]
+      ) %>%
+      group_by(Crop_Year) %>%
+      summarise(
+        Avg_Yield = mean(Yield, na.rm = TRUE),
+        Avg_Production = sum(Production, na.rm = TRUE),
+        .groups = 'drop'
+      )
+  }
+  
+  # Join MSP and performance data
+  combined_data <- msp_filtered %>%
+    left_join(perf_data, by = "Crop_Year") %>%
+    arrange(Crop_Year)
+  
+  # Create scatter plot with trend line
+  p <- ggplot(combined_data, aes(x = Avg_MSP, y = get(metric_var),
+                               text = paste("Year:", Crop_Year,
+                                         "<br>MSP: ₹", round(Avg_MSP, 2),
+                                         "<br>", metric_label, ":", round(get(metric_var), 2)))) +
+    geom_point(aes(color = Crop_Year), size = 4) +
+    geom_smooth(method = "lm", color = "red", fill = "pink", alpha = 0.2) +
+    scale_color_viridis_c(option = "plasma") +
+    theme_minimal() +
+    labs(
+      title = paste("MSP vs", metric_label, "Relationship"),
+      subtitle = paste("For", input$crop_msp, 
+                      ifelse(input$state_msp == "All India", "(National)", 
+                            paste("in", input$state_msp))),
+      x = "MSP (₹)",
+      y = metric_label
+    ) +
+    theme(
+      legend.title = element_text(size = 10),
+      legend.position = "bottom"
+    )
+  
+  ggplotly(p, tooltip = "text") %>%
+    layout(legend = list(orientation = "h", y = -0.2))
+})
+```
+
+### Statistics & Growth Indicators
+
+```{r msp_yield_stats}
+renderTable({
+  req(input$crop_msp)
+  
+  # Determine which metric to use
+  metric_var <- ifelse(input$metric_msp == "Yield", "Avg_Yield", "Avg_Production")
+  metric_label <- ifelse(input$metric_msp == "Yield", "Yield", "Production")
+  
+  # Get MSP data
+  msp_stats <- msp_long %>%
+    filter(
+      Crop == input$crop_msp,
+      Crop_Year >= input$years_msp[1],
+      Crop_Year <= input$years_msp[2]
+    )
+  
+  # Get performance data
+  if(input$state_msp == "All India") {
+    perf_stats <- df_states %>%
+      filter(
+        Crop == input$crop_msp,
+        Crop_Year >= input$years_msp[1],
+        Crop_Year <= input$years_msp[2]
+      ) %>%
+      group_by(Crop_Year) %>%
+      summarise(
+        Avg_Yield = mean(Yield, na.rm = TRUE),
+        Avg_Production = sum(Production, na.rm = TRUE),
+        .groups = 'drop'
+      )
+  } else {
+    perf_stats <- df_states %>%
+      filter(
+        State == input$state_msp,
+        Crop == input$crop_msp,
+        Crop_Year >= input$years_msp[1],
+        Crop_Year <= input$years_msp[2]
+      ) %>%
+      group_by(Crop_Year) %>%
+      summarise(
+        Avg_Yield = mean(Yield, na.rm = TRUE),
+        Avg_Production = sum(Production, na.rm = TRUE),
+        .groups = 'drop'
+      )
+  }
+  
+  # Combine and calculate correlation
+  combined_stats <- msp_stats %>%
+    left_join(perf_stats, by = "Crop_Year") %>%
+    arrange(Crop_Year)
+  
+  correlation <- cor(combined_stats$Avg_MSP, combined_stats[[metric_var]], use = "complete.obs")
+  
+  # Calculate CAGR (Compound Annual Growth Rate) for MSP
+  first_msp <- combined_stats %>% 
+    filter(Crop_Year == min(Crop_Year)) %>% 
+    pull(Avg_MSP)
+  
+  last_msp <- combined_stats %>% 
+    filter(Crop_Year == max(Crop_Year)) %>% 
+    pull(Avg_MSP)
+  
+  # Calculate CAGR for yield/production
+  first_metric <- combined_stats %>% 
+    filter(Crop_Year == min(Crop_Year)) %>% 
+    pull(metric_var)
+  
+  last_metric <- combined_stats %>% 
+    filter(Crop_Year == max(Crop_Year)) %>% 
+    pull(metric_var)
+  
+  years_diff <- max(combined_stats$Crop_Year) - min(combined_stats$Crop_Year)
+  
+  # Avoid division by zero
+  if(years_diff > 0) {
+    msp_cagr <- (last_msp / first_msp)^(1/years_diff) - 1
+    metric_cagr <- (last_metric / first_metric)^(1/years_diff) - 1
+  } else {
+    msp_cagr <- 0
+    metric_cagr <- 0
+  }
+  
+  # Calculate linear regression to find elasticity
+  model <- lm(log(get(metric_var)) ~ log(Avg_MSP), data = combined_stats)
+  elasticity <- coef(model)[2]
+  
+  # Create stats table
+  stats_table <- data.frame(
+    Statistic = c(
+      "Average MSP (₹)",
+      "MSP Growth (CAGR)",
+      paste("Average", metric_label),
+      paste(metric_label, "Growth (CAGR)"),
+      "MSP-to-Performance Correlation",
+      paste(metric_label, "Elasticity to Price"),
+      "Period"
+    ),
+    Value = c(
+      round(mean(combined_stats$Avg_MSP, na.rm = TRUE), 2),
+      paste0(round(msp_cagr * 100, 2), "%"),
+      round(mean(combined_stats[[metric_var]], na.rm = TRUE), 2),
+      paste0(round(metric_cagr * 100, 2), "%"),
+      round(correlation, 2),
+      round(elasticity, 2),
+      paste(min(combined_stats$Crop_Year), "-", max(combined_stats$Crop_Year))
+    )
+  )
+  
+  stats_table
+}, rownames = FALSE)
+```
+
+# District-State Comparison {data-navmenu="Comparative Analysis"}
+
+## Column {.sidebar}
+
+```{r sidebar_filters_tab_district}
+# Load district data
+df_district <- read.csv("C:/Users/dodo2/Downloads/DV/df_districts.csv")
+
+# Clean state and district names for consistency
+df_district$State <- str_to_title(df_district$State)
+df_district$District <- str_to_title(df_district$District)
+
+# Extract unique values from district data
+district_states <- sort(unique(df_district$State)) 
+district_crops <- sort(unique(df_district$Crop))
+district_seasons <- sort(unique(str_trim(df_district$Season)))
+district_years <- sort(unique(df_district$Crop_Year))
+
+# Create filter inputs
+selectInput(
+  "state_district_comp",
+  label = "Select State",
+  choices = district_states,
+  selected = district_states[1]
+)
+
+# Update district choices based on selected state
+observe({
+  state_districts <- sort(unique(df_district$District[df_district$State == input$state_district_comp]))
+  updateSelectInput(
+    session,
+    "district_comp",
+    label = "Select District",
+    choices = state_districts,
+    selected = state_districts[1]
+  )
+})
+
+selectInput(
+  "district_comp",
+  label = "Select District",
+  choices = NULL
+)
+
+selectInput(
+  "crop_district_comp",
+  label = "Select Crop",
+  choices = c("All Crops", "Rice", "Wheat", "Cotton(lint)", "Soyabean", "Jowar"),
+  selected = "All Crops"
+)
+
+selectInput(
+  "season_district_comp",
+  label = "Select Season",
+  choices = c("All Seasons", district_seasons),
+  selected = "All Seasons"
+)
+
+sliderInput(
+  "years_district_comp",
+  label = "Year Range",
+  min = 2000,
+  max = max(district_years),
+  value = c(min(district_years) + 5, max(district_years)),
+  step = 1
+)
+
+radioButtons(
+  "metric_district_comp",
+  label = "Select Metric",
+  choices = c("Yield", "Production", "Area"),
+  selected = "Yield"
+)
+
+helpText("Compare district performance against state average.")
+```
+
+## Column {data-width="700"}
+
+### District vs State Average Performance
+
+```{r district_vs_state_plot}
+renderPlotly({
+  req(input$state_district_comp, input$district_comp)
+  
+  # Prepare filters
+  selected_crop <- input$crop_district_comp
+  selected_season <- input$season_district_comp
+  selected_metric <- input$metric_district_comp
+  
+  # Create base filtered data
+  base_filtered_data <- df_district %>%
+    filter(
+      State == input$state_district_comp,
+      Crop_Year >= input$years_district_comp[1],
+      Crop_Year <= input$years_district_comp[2]
+    )
+  
+  # Apply optional crop and season filters
+  if (selected_crop != "All Crops") {
+    base_filtered_data <- base_filtered_data %>% filter(Crop == selected_crop)
+  }
+  
+  if (selected_season != "All Seasons") {
+    base_filtered_data <- base_filtered_data %>% filter(str_trim(Season) == selected_season)
+  }
+  
+  # Calculate district averages by year
+  district_data <- base_filtered_data %>%
+    filter(District == input$district_comp) %>%
+    group_by(Crop_Year) %>%
+    summarise(
+      District_Yield = mean(Yield, na.rm = TRUE),
+      District_Production = sum(Production, na.rm = TRUE),
+      District_Area = sum(Area, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  # Calculate state averages by year (directly from df_district)
+  state_data <- base_filtered_data %>%
+    group_by(Crop_Year) %>%
+    summarise(
+      State_Yield = mean(Yield, na.rm = TRUE),
+      State_Production = sum(Production, na.rm = TRUE),
+      State_Area = sum(Area, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  # Join district and state data
+  combined_data <- district_data %>%
+    left_join(state_data, by = "Crop_Year")
+  
+  # Transform data for plotting
+  plot_data <- combined_data %>%
+    pivot_longer(
+      cols = c(
+        paste0("District_", selected_metric),
+        paste0("State_", selected_metric)
+      ),
+      names_to = "Category",
+      values_to = "Value"
+    ) %>%
+    mutate(
+      Category = ifelse(
+        Category == paste0("District_", selected_metric),
+        paste(input$district_comp, "District"),
+        paste(input$state_district_comp, "State Average")
+      )
+    )
+  
+  # Create bar plot
+  p <- ggplot(plot_data, aes(x = factor(Crop_Year), y = Value, fill = Category,
+                        text = paste("Year:", Crop_Year,
+                                  "<br>", Category, ":", round(Value, 2)))) +
+    geom_bar(stat = "identity", position = position_dodge(width = 0.9), width = 0.8) +
+    scale_fill_manual(values = c("#1f77b4", "#ff7f0e")) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.title = element_blank(),
+      legend.position = "top"
+    ) +
+    labs(
+      title = paste(selected_metric, "Comparison:", input$district_comp, "vs", input$state_district_comp, "Average"),
+      subtitle = paste0(
+        if(selected_crop != "All Crops") paste("Crop:", selected_crop) else "All Crops",
+        if(selected_season != "All Seasons") paste(" | Season:", selected_season) else ""
+      ),
+      x = "Year",
+      y = selected_metric
+    )
+  
+  ggplotly(p, tooltip = "text") %>%
+    layout(legend = list(orientation = "h", y = 1.1))
+})
+```
+
+### Performance Gap Analysis
+
+```{r district_performance_gap}
+renderPlotly({
+  req(input$state_district_comp, input$district_comp)
+  
+  # Prepare filters
+  selected_crop <- input$crop_district_comp
+  selected_season <- input$season_district_comp
+  selected_metric <- input$metric_district_comp
+  
+  # Create base filtered data
+  base_filtered_data <- df_district %>%
+    filter(
+      State == input$state_district_comp,
+      Crop_Year >= input$years_district_comp[1],
+      Crop_Year <= input$years_district_comp[2]
+    )
+  
+  # Apply optional crop and season filters
+  if (selected_crop != "All Crops") {
+    base_filtered_data <- base_filtered_data %>% filter(Crop == selected_crop)
+  }
+  
+  if (selected_season != "All Seasons") {
+    base_filtered_data <- base_filtered_data %>% filter(str_trim(Season) == selected_season)
+  }
+  
+  # Calculate district averages by year
+  district_data <- base_filtered_data %>%
+    filter(District == input$district_comp) %>%
+    group_by(Crop_Year) %>%
+    summarise(
+      District_Yield = mean(Yield, na.rm = TRUE),
+      District_Production = sum(Production, na.rm = TRUE),
+      District_Area = sum(Area, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  # Calculate state averages by year (directly from df_district)
+  state_data <- base_filtered_data %>%
+    group_by(Crop_Year) %>%
+    summarise(
+      State_Yield = mean(Yield, na.rm = TRUE),
+      State_Production = sum(Production, na.rm = TRUE),
+      State_Area = sum(Area, na.rm = TRUE),
+      .groups = 'drop'
+    )
+  
+  # Join district and state data
+  combined_data <- district_data %>%
+    left_join(state_data, by = "Crop_Year")
+  
+  # Calculate gap/difference and percentage difference
+  gap_data <- combined_data %>%
+    mutate(
+      Gap = get(paste0("District_", selected_metric)) - get(paste0("State_", selected_metric)),
+      Gap_Percent = (Gap / get(paste0("State_", selected_metric))) * 100
+    )
+  
+  # Create gap plot
+  p <- ggplot(gap_data, aes(x = factor(Crop_Year), y = Gap_Percent, fill = Gap_Percent >= 0,
+                        text = paste("Year:", Crop_Year,
+                                  "<br>Gap (%):", round(Gap_Percent, 2),
+                                  "<br>Absolute Gap:", round(Gap, 2)))) +
+    geom_bar(stat = "identity", width = 0.7) +
+    scale_fill_manual(values = c("#d62728", "#2ca02c"), guide = "none") +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1)
+    ) +
+    labs(
+      title = paste("Performance Gap (%) between", input$district_comp, "and State Average"),
+      subtitle = paste0(
+        "Metric: ", selected_metric, " | ",
+        if(selected_crop != "All Crops") paste("Crop:", selected_crop) else "All Crops",
+        if(selected_season != "All Seasons") paste(" | Season:", selected_season) else ""
+      ),
+      x = "Year",
+      y = "Difference (%)"
+    )
+  
+  ggplotly(p, tooltip = "text")
+})
+```
+
+### Top 10 Districts in Selected State
+
+```{r top_10_districts_plot}
+renderPlotly({
+  req(input$state_district_comp)
+  
+  # Prepare filters
+  selected_crop <- input$crop_district_comp
+  selected_season <- input$season_district_comp
+  selected_metric <- input$metric_district_comp
+  
+  # Create base filtered data
+  base_filtered_data <- df_district %>%
+    filter(
+      State == input$state_district_comp,
+      Crop_Year >= input$years_district_comp[1],
+      Crop_Year <= input$years_district_comp[2]
+    )
+  
+  # Apply optional crop and season filters
+  if (selected_crop != "All Crops") {
+    base_filtered_data <- base_filtered_data %>% filter(Crop == selected_crop)
+  }
+  
+  if (selected_season != "All Seasons") {
+    base_filtered_data <- base_filtered_data %>% filter(str_trim(Season) == selected_season)
+  }
+  
+  # Calculate district averages and identify top 10
+  district_data <- base_filtered_data %>%
+    group_by(District) %>%
+    summarise(
+      Value = if(selected_metric == "Yield") mean(Yield, na.rm = TRUE) 
+              else if(selected_metric == "Production") sum(Production, na.rm = TRUE)
+              else sum(Area, na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(Value)) %>%
+    head(10)
+  
+  # Calculate state average for comparison
+  state_avg <- base_filtered_data %>%
+    summarise(
+      State_Avg = if(selected_metric == "Yield") mean(Yield, na.rm = TRUE) 
+                  else if(selected_metric == "Production") sum(Production, na.rm = TRUE) / n_distinct(base_filtered_data$Crop_Year)
+                  else sum(Area, na.rm = TRUE) / n_distinct(base_filtered_data$Crop_Year)
+    ) %>%
+    pull(State_Avg)
+  
+  # Highlight the selected district
+  district_data <- district_data %>%
+    mutate(
+      Selected = District == input$district_comp,
+      District = factor(District, levels = rev(District))  # Reverse for horizontal bar chart
+    )
+  
+  # Create color vector with special color for selected district
+  district_colors <- ifelse(district_data$Selected, "#ff7f0e", "#1f77b4")
+  
+  # Create bar plot
+  p <- ggplot(district_data, aes(x = District, y = Value, fill = Selected,
+                        text = paste("District:", District,
+                                  "<br>", selected_metric, ":", round(Value, 2),
+                                  "<br>Compared to State Avg:", paste0(round((Value/state_avg - 1) * 100, 1), "%")))) +
+    geom_bar(stat = "identity") +
+    scale_fill_manual(values = c("#1f77b4", "#ff7f0e"), guide = "none") +
+    geom_hline(yintercept = state_avg, linetype = "dashed", color = "red") +
+    annotate("text", x = 1, y = state_avg * 1.05, label = "State Average", color = "red", hjust = 0) +
+    coord_flip() +
+    theme_minimal() +
+    theme(
+      axis.text.y = element_text(size = 9),
+      plot.margin = margin(r = 30)
+    ) +
+    labs(
+      title = paste("Top 10 Districts by", selected_metric),
+      subtitle = paste0(
+        "State: ", input$state_district_comp, " | ",
+        if(selected_crop != "All Crops") paste("Crop:", selected_crop) else "All Crops",
+        if(selected_season != "All Seasons") paste(" | Season:", selected_season) else ""
+      ),
+      x = "",
+      y = selected_metric
+    )
+  
+  ggplotly(p, tooltip = "text")
+})
+```
+
+## Column {data-width="300"}
+
+### District Statistics & Ranking
+
+```{r district_stats}
+renderTable({
+  req(input$state_district_comp, input$district_comp)
+  
+  # Prepare filters
+  selected_crop <- input$crop_district_comp
+  selected_season <- input$season_district_comp
+  selected_metric <- input$metric_district_comp
+  
+  # Create base filtered data
+  base_filtered_data <- df_district %>%
+    filter(
+      State == input$state_district_comp,
+      Crop_Year >= input$years_district_comp[1],
+      Crop_Year <= input$years_district_comp[2]
+    )
+  
+  # Apply optional crop and season filters
+  if (selected_crop != "All Crops") {
+    base_filtered_data <- base_filtered_data %>% filter(Crop == selected_crop)
+  }
+  
+  if (selected_season != "All Seasons") {
+    base_filtered_data <- base_filtered_data %>% filter(str_trim(Season) == selected_season)
+  }
+  
+  # Calculate district-wise averages and ranking
+  district_rankings <- base_filtered_data %>%
+    group_by(District) %>%
+    summarise(
+      Avg_Value = mean(get(selected_metric), na.rm = TRUE),
+      .groups = 'drop'
+    ) %>%
+    arrange(desc(Avg_Value)) %>%
+    mutate(Rank = row_number())
+  
+  # Get state average directly from district data
+  state_avg <- base_filtered_data %>%
+    summarise(State_Avg = mean(get(selected_metric), na.rm = TRUE)) %>%
+    pull(State_Avg)
+  
+  # Extract data for the selected district
+  selected_district_data <- district_rankings %>%
+    filter(District == input$district_comp)
+  
+  # Calculate performance metrics
+  performance_data <- data.frame(
+    Statistic = c(
+      paste(input$district_comp, "Average", selected_metric),
+      paste("State Average", selected_metric),
+      "Difference from State Average", 
+      "Difference from State Average (%)",
+      paste("Rank among", nrow(district_rankings), "districts"),
+      "Percentile in State",
+      paste("Period")
+    ),
+    Value = c(
+      round(selected_district_data$Avg_Value, 2),
+      round(state_avg, 2),
+      round(selected_district_data$Avg_Value - state_avg, 2),
+      paste0(round(((selected_district_data$Avg_Value - state_avg) / state_avg) * 100, 2), "%"),
+      paste0(selected_district_data$Rank, " / ", nrow(district_rankings)),
+      paste0(round((1 - (selected_district_data$Rank / nrow(district_rankings))) * 100, 1), "%"),
+      paste(min(input$years_district_comp), "-", max(input$years_district_comp))
+    )
+  )
+  
+  performance_data
+}, rownames = FALSE)
+```
+
+
+# Data Explorer {data-navmenu="Explore Data"}
+
+## Column {.sidebar}
+
+```{r sidebar_filters_tab5}
+selectInput(
+  "state_explorer",
+  label = "Select State",
+  choices = c("All States", states),
+  selected = "All States"
+)
+
+selectInput(
+  "crop_explorer",
+  label = "Select Crop",
+  choices = c("All Crops", crops),
+  selected = "All Crops"
+)
+
+sliderInput(
+  "year_explorer",
+  label = "Select Year",
+  min = min(years),
+  max = max(years),
+  value = max(years),
+  step = 1
+)
+
+helpText("Explore the raw data with custom filters.")
+```
+
+## Column
+
+### Raw Data Explorer
+
+```{r data_explorer}
+renderDataTable({
+  # Apply filters based on selections
+  filtered_data <- df_states
+  
+  if(input$state_explorer != "All States") {
+    filtered_data <- filtered_data %>% filter(State == input$state_explorer)
+  }
+  
+  if(input$crop_explorer != "All Crops") {
+    filtered_data <- filtered_data %>% filter(Crop == input$crop_explorer)
+  }
+  
+  filtered_data <- filtered_data %>% filter(Crop_Year == input$year_explorer)
+  
+  # Format and display the data
+  filtered_data %>%
+    select(State, Region, Crop, Crop_Year, Area, Production, Yield, Annual_Rainfall, Fertilizer, Pesticide) %>%
+    mutate(
+      Area = round(Area, 2),
+      Production = round(Production, 2),
+      Yield = round(Yield, 2),
+      Annual_Rainfall = round(Annual_Rainfall, 2),
+      Fertilizer = round(Fertilizer, 2),
+      Pesticide = round(Pesticide, 2)
+    ) %>%
+    datatable(
+      options = list(
+        pageLength = 15,
+        scrollX = TRUE
+      )
+    )
+})
+```
